@@ -1,1 +1,270 @@
+# Prepare le paquet NetBox hors ligne (images Docker + installeurs + scripts).
+# Lancement : onglet Actions > "Preparer NetBox hors ligne" > Run workflow.
+name: Preparer NetBox hors ligne
 
+on:
+  workflow_dispatch:
+
+jobs:
+  paquet:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Telecharger netbox-docker (branche release)
+        run: |
+          mkdir -p paquet
+          git clone --depth 1 -b release https://github.com/netbox-community/netbox-docker.git paquet/netbox-docker-release
+          rm -rf paquet/netbox-docker-release/.git
+          cp paquet/netbox-docker-release/docker-compose.override.yml.example paquet/netbox-docker-release/docker-compose.override.yml
+
+      - name: Telecharger les images NetBox et les mettre dans un fichier
+        working-directory: paquet/netbox-docker-release
+        run: |
+          docker compose pull
+          docker save -o netbox-images.tar $(docker compose config --images)
+          ls -lh netbox-images.tar
+
+      - name: Telecharger les installeurs Docker Desktop et WSL
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          curl -fL -o "paquet/Docker Desktop Installer.exe" "https://desktop.docker.com/win/main/amd64/Docker%20Desktop%20Installer.exe"
+          gh release download --repo microsoft/WSL --pattern '*.x64.msi' --dir paquet
+
+      - name: Ecrire les scripts d'installation
+        run: |
+          cat > paquet/installer-netbox.bat <<'NBEOF'
+          @echo off
+          rem Double-cliquez sur ce fichier pour installer NetBox.
+          rem Il se relance automatiquement en administrateur.
+
+          net session >nul 2>&1
+          if %errorlevel% neq 0 (
+              powershell -NoProfile -Command "Start-Process -FilePath '%~f0' -Verb RunAs"
+              exit /b
+          )
+
+          powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0installer-netbox.ps1"
+          NBEOF
+          cat > paquet/installer-netbox.ps1 <<'NBEOF'
+          # =====================================================================
+          #  Installation automatique de NetBox sur un PC Windows 11 SANS Internet
+          #  A lancer via installer-netbox.bat (clic droit > Executer en tant qu'admin
+          #  n'est pas necessaire : le .bat le demande tout seul).
+          #
+          #  Contenu attendu a cote de ce script :
+          #    - Docker Desktop Installer.exe
+          #    - wsl.X.X.X.X.x64.msi
+          #    - netbox-docker-release\   (avec netbox-images.tar dedans)
+          #
+          #  Le script peut etre relance autant de fois que necessaire :
+          #  il saute les etapes deja faites.
+          # =====================================================================
+
+          # 'Continue' : les erreurs des commandes docker sont verifiees une par une
+          # (en mode 'Stop', PowerShell 5.1 plante sur leurs simples messages d'information)
+          $ErrorActionPreference = 'Continue'
+
+          # ---------- Reglages (modifiables) ----------
+          $Dest        = 'C:\NetBoxSetup'          # dossier d'installation local
+          $AdminUser   = 'admin'                   # nom du compte NetBox a creer
+          $AdminEmail  = 'admin@example.com'
+          $Port        = 8000                      # http://localhost:8000
+          $TaskName    = 'InstallNetBox-Reprise'
+          # --------------------------------------------
+
+          $ProjectDir  = Join-Path $Dest 'netbox-docker-release'
+          $ImagesTar   = Join-Path $ProjectDir 'netbox-images.tar'
+          $DockerExe   = 'C:\Program Files\Docker\Docker\Docker Desktop.exe'
+          $DockerBin   = 'C:\Program Files\Docker\Docker\resources\bin'
+          $WslExe      = 'C:\Program Files\WSL\wsl.exe'
+
+          New-Item -ItemType Directory -Force -Path $Dest | Out-Null
+          Start-Transcript -Path (Join-Path $Dest 'install.log') -Append | Out-Null
+
+          function Etape($texte) { Write-Host "`n==> $texte" -ForegroundColor Cyan }
+          function Ok($texte)    { Write-Host "    OK : $texte" -ForegroundColor Green }
+          function Stop-Erreur($texte) {
+              Write-Host "`n    ERREUR : $texte" -ForegroundColor Red
+              Stop-Transcript | Out-Null
+              Read-Host "`nAppuyez sur Entree pour fermer"
+              exit 1
+          }
+
+          # ---------- 0. Droits administrateur ----------
+          $estAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
+                      ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+          if (-not $estAdmin) { Stop-Erreur "Lancez le script via installer-netbox.bat (droits administrateur requis)." }
+
+          # ---------- 1. Copier les fichiers de la cle vers C:\NetBoxSetup ----------
+          Etape "Copie des fichiers vers $Dest"
+          $Src = $PSScriptRoot
+          if ($Src.TrimEnd('\') -ne $Dest.TrimEnd('\')) {
+              $deja = (Test-Path $ImagesTar) -and
+                      ((Get-Item $ImagesTar).Length -eq (Get-Item (Join-Path $Src 'netbox-docker-release\netbox-images.tar') -ErrorAction SilentlyContinue).Length)
+              if ($deja) {
+                  Ok "fichiers deja copies"
+              } else {
+                  Write-Host "    Copie en cours (1 a 3 minutes)..."
+                  try { Copy-Item -Path (Join-Path $Src '*') -Destination $Dest -Recurse -Force -ErrorAction Stop }
+                  catch { Stop-Erreur "copie impossible : $($_.Exception.Message)" }
+                  Ok "copie terminee"
+              }
+          }
+          Get-ChildItem -Path $Dest -Recurse | Unblock-File
+
+          $DockerSetup = Get-ChildItem -Path $Dest -Filter 'Docker Desktop Installer.exe' | Select-Object -First 1
+          $WslMsi      = Get-ChildItem -Path $Dest -Filter 'wsl*x64.msi' | Select-Object -First 1
+          if (-not $DockerSetup)          { Stop-Erreur "'Docker Desktop Installer.exe' introuvable a cote du script." }
+          if (-not $WslMsi)               { Stop-Erreur "Fichier 'wsl...x64.msi' introuvable a cote du script." }
+          if (-not (Test-Path $ImagesTar)) { Stop-Erreur "netbox-docker-release\netbox-images.tar introuvable." }
+
+          # ---------- 2. Virtualisation ----------
+          Etape "Verification de la virtualisation"
+          $cpu = Get-CimInstance Win32_Processor | Select-Object -First 1
+          $sys = Get-CimInstance Win32_ComputerSystem
+          if (-not ($cpu.VirtualizationFirmwareEnabled -or $sys.HypervisorPresent)) {
+              Stop-Erreur "La virtualisation est desactivee. Activez-la dans le BIOS (Intel VT-x / AMD SVM), puis relancez le script."
+          }
+          Ok "virtualisation activee"
+
+          $redemarrageNecessaire = $false
+
+          # ---------- 3. Fonctions Windows ----------
+          Etape "Activation des fonctions Windows (WSL + plateforme de machine virtuelle)"
+          foreach ($f in 'Microsoft-Windows-Subsystem-Linux', 'VirtualMachinePlatform') {
+              $etat = (Get-WindowsOptionalFeature -Online -FeatureName $f).State
+              if ($etat -ne 'Enabled') {
+                  $r = Enable-WindowsOptionalFeature -Online -FeatureName $f -All -NoRestart
+                  if ($r.RestartNeeded) { $redemarrageNecessaire = $true }
+                  Ok "$f activee"
+              } else { Ok "$f deja activee" }
+          }
+
+          # ---------- 4. WSL ----------
+          Etape "Installation de WSL"
+          if (Test-Path $WslExe) {
+              Ok "WSL deja installe"
+          } else {
+              $p = Start-Process msiexec.exe -ArgumentList "/i `"$($WslMsi.FullName)`" /quiet /norestart" -Wait -PassThru
+              if ($p.ExitCode -notin 0, 3010) { Stop-Erreur "installation de WSL echouee (code $($p.ExitCode))." }
+              if ($p.ExitCode -eq 3010) { $redemarrageNecessaire = $true }
+              Ok "WSL installe"
+          }
+
+          # ---------- 5. Docker Desktop ----------
+          Etape "Installation de Docker Desktop"
+          if (Test-Path $DockerExe) {
+              Ok "Docker Desktop deja installe"
+          } else {
+              Write-Host "    Installation silencieuse (3 a 5 minutes)..."
+              $p = Start-Process $DockerSetup.FullName -ArgumentList 'install', '--quiet', '--accept-license', '--backend=wsl-2' -Wait -PassThru
+              if ($p.ExitCode -ne 0) { Stop-Erreur "installation de Docker echouee (code $($p.ExitCode))." }
+              $redemarrageNecessaire = $true
+              Ok "Docker Desktop installe"
+          }
+          # l'utilisateur doit etre dans le groupe docker-users
+          $moi = "$env:USERDOMAIN\$env:USERNAME"
+          $membres = net localgroup docker-users 2>$null
+          if (-not ($membres -match [regex]::Escape($env:USERNAME))) {
+              net localgroup docker-users $moi /add | Out-Null
+              $redemarrageNecessaire = $true
+              Ok "$moi ajoute au groupe docker-users"
+          }
+
+          # ---------- 6. Redemarrage puis reprise automatique ----------
+          if ($redemarrageNecessaire) {
+              Etape "Redemarrage necessaire"
+              $action    = New-ScheduledTaskAction -Execute 'powershell.exe' `
+                           -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$Dest\installer-netbox.ps1`""
+              $trigger   = New-ScheduledTaskTrigger -AtLogOn -User $moi
+              $principal = New-ScheduledTaskPrincipal -UserId $moi -LogonType Interactive -RunLevel Highest
+              Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Principal $principal -Force | Out-Null
+              Write-Host "    Le PC va redemarrer. Reconnectez-vous avec le MEME compte :" -ForegroundColor Yellow
+              Write-Host "    l'installation reprendra toute seule." -ForegroundColor Yellow
+              Stop-Transcript | Out-Null
+              Read-Host "`nAppuyez sur Entree pour redemarrer maintenant"
+              Restart-Computer -Force
+              exit 0
+          }
+          Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
+
+          # ---------- 7. Demarrer Docker ----------
+          Etape "Demarrage de Docker (jusqu'a 5 minutes)"
+          $env:Path = "$DockerBin;$env:Path"
+          # lance via l'explorateur pour que Docker Desktop tourne SANS droits admin (mode normal)
+          if (-not (Get-Process 'Docker Desktop' -ErrorAction SilentlyContinue)) { Start-Process explorer.exe -ArgumentList "`"$DockerExe`"" }
+          $limite = (Get-Date).AddMinutes(5)
+          do {
+              Start-Sleep -Seconds 5
+              docker info *> $null
+          } until ($LASTEXITCODE -eq 0 -or (Get-Date) -gt $limite)
+          if ($LASTEXITCODE -ne 0) { Stop-Erreur "Docker ne demarre pas. Ouvrez Docker Desktop pour voir le message, puis relancez le script." }
+          Ok "Docker est pret"
+
+          Set-Location $ProjectDir
+
+          # ---------- 8. Charger les images ----------
+          Etape "Chargement des images NetBox"
+          $override = Join-Path $ProjectDir 'docker-compose.override.yml'
+          if (-not (Test-Path $override)) {
+              Copy-Item (Join-Path $ProjectDir 'docker-compose.override.yml.example') $override
+          }
+          $yaml = (Get-Content $override) -replace '\d+:8080', "${Port}:8080"
+          [IO.File]::WriteAllLines($override, $yaml)   # UTF-8 sans BOM, sinon docker compose peut refuser le fichier
+
+          $manquantes = docker compose config --images | Where-Object { docker image inspect $_ *> $null; $LASTEXITCODE -ne 0 }
+          if ($manquantes) {
+              Write-Host "    Chargement de netbox-images.tar (1 a 3 minutes)..."
+              docker load -i $ImagesTar
+              if ($LASTEXITCODE -ne 0) { Stop-Erreur "docker load a echoue." }
+              Ok "images chargees"
+          } else { Ok "images deja presentes" }
+
+          # ---------- 9. Lancer NetBox ----------
+          Etape "Demarrage de NetBox (2 a 10 minutes au premier lancement)"
+          docker compose up -d --pull never
+          if ($LASTEXITCODE -ne 0) { Stop-Erreur "docker compose up a echoue (voir les messages ci-dessus)." }
+          $limite = (Get-Date).AddMinutes(10)
+          do {
+              Start-Sleep -Seconds 10
+              $id = docker compose ps -q netbox
+              $sante = if ($id) { docker inspect -f '{{.State.Health.Status}}' $id } else { 'absent' }
+              Write-Host "    etat de netbox : $sante"
+          } until ($sante -eq 'healthy' -or (Get-Date) -gt $limite)
+          if ($sante -ne 'healthy') { Stop-Erreur "NetBox n'est pas pret apres 10 minutes. Voir : docker compose logs netbox" }
+          Ok "NetBox fonctionne"
+
+          # ---------- 10. Compte administrateur ----------
+          Etape "Creation du compte administrateur '$AdminUser'"
+          $test = docker compose exec -T netbox /opt/netbox/netbox/manage.py shell -c "from django.contrib.auth import get_user_model; print(get_user_model().objects.filter(username='$AdminUser').exists())" 2>$null
+          if ("$test" -match 'True') {
+              Ok "le compte '$AdminUser' existe deja"
+          } else {
+              do {
+                  $mdp1 = Read-Host "    Choisissez un mot de passe pour '$AdminUser'" -AsSecureString
+                  $mdp2 = Read-Host "    Retapez-le" -AsSecureString
+                  $p1 = [Runtime.InteropServices.Marshal]::PtrToStringAuto([Runtime.InteropServices.Marshal]::SecureStringToBSTR($mdp1))
+                  $p2 = [Runtime.InteropServices.Marshal]::PtrToStringAuto([Runtime.InteropServices.Marshal]::SecureStringToBSTR($mdp2))
+                  if ($p1 -ne $p2 -or $p1.Length -lt 8) { Write-Host "    Les mots de passe different ou font moins de 8 caracteres. Recommencez." -ForegroundColor Yellow }
+              } until ($p1 -eq $p2 -and $p1.Length -ge 8)
+              docker compose exec -T -e "DJANGO_SUPERUSER_PASSWORD=$p1" netbox /opt/netbox/netbox/manage.py createsuperuser --noinput --username $AdminUser --email $AdminEmail
+              if ($LASTEXITCODE -ne 0) { Stop-Erreur "creation du compte echouee." }
+              Ok "compte cree"
+          }
+
+          # ---------- Fin ----------
+          Etape "Installation terminee"
+          Write-Host "    Ouvrez http://localhost:$Port et connectez-vous avec '$AdminUser'." -ForegroundColor Green
+          Start-Process "http://localhost:$Port"
+          Stop-Transcript | Out-Null
+          Read-Host "`nAppuyez sur Entree pour fermer"
+          NBEOF
+          sed -i 's/\r*$/\r/' paquet/installer-netbox.bat paquet/installer-netbox.ps1
+          ls -la paquet
+
+      - name: Mettre le paquet a disposition
+        uses: actions/upload-artifact@v4
+        with:
+          name: netbox-hors-ligne
+          path: paquet/
+          retention-days: 7
