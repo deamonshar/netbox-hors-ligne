@@ -1,4 +1,4 @@
-# Installer NetBox sur un PC Windows 11 sans Internet – Tuto débutant
+# Installer NetBox sur un PC Windows 11 sans Internet
 
 Nov 24, 2026 · @Shara
 
