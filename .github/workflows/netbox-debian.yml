@@ -1,0 +1,221 @@
+# Construit l'installeur NetBox autonome pour Debian 12 (netbox-debian.run)
+# et le publie a une adresse fixe :
+#   https://github.com/<votre-nom>/<depot>/releases/download/netbox-debian/netbox-debian.run
+# Il se reconstruit tout seul chaque lundi (derniere version de NetBox),
+# ou a la demande : onglet Actions > "Installeur NetBox Debian" > Run workflow.
+name: Installeur NetBox Debian
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '17 3 * * 1'
+
+permissions:
+  contents: write
+
+jobs:
+  installeur:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Telecharger netbox-docker (branche release)
+        run: |
+          mkdir -p paquet/debs
+          git clone --depth 1 -b release https://github.com/netbox-community/netbox-docker.git paquet/netbox-docker-release
+          rm -rf paquet/netbox-docker-release/.git
+
+      - name: Telecharger les images NetBox
+        working-directory: paquet/netbox-docker-release
+        run: |
+          docker compose pull
+          docker save -o netbox-images.tar $(docker compose config --images)
+          ls -lh netbox-images.tar
+
+      - name: Telecharger les paquets Docker pour Debian 12 (avec leurs dependances)
+        run: |
+          docker run --rm -v "$PWD/paquet/debs:/out" debian:12 bash -ec '
+            apt-get update
+            apt-get install -y --no-install-recommends ca-certificates curl
+            install -m 0755 -d /etc/apt/keyrings
+            curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc
+            echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian bookworm stable" > /etc/apt/sources.list.d/docker.list
+            apt-get update
+            apt-get clean
+            apt-get install -y --no-install-recommends --download-only \
+              docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin iptables apparmor
+            cp /var/cache/apt/archives/*.deb /out/
+          '
+          ls -lh paquet/debs
+
+      - name: Ecrire les scripts
+        run: |
+          cat > paquet/installer-netbox.sh <<'NBEOF'
+          #!/usr/bin/env bash
+          # =====================================================================
+          #  Installation automatique de NetBox sur Debian 12 SANS Internet
+          #  Normalement lance par netbox-debian.run (qui l'extrait dans /opt/netbox).
+          #  Lancement manuel (en root) :   bash /opt/netbox/installer-netbox.sh
+          #
+          #  Contenu attendu a cote de ce script :
+          #    - debs/                    (paquets Docker pour Debian 12)
+          #    - netbox-docker-release/   (avec netbox-images.tar dedans)
+          #
+          #  Le script peut etre relance autant de fois que necessaire :
+          #  il saute les etapes deja faites.
+          # =====================================================================
+          set -u
+
+          # ---------- Reglages (modifiables) ----------
+          PORT="${NETBOX_PORT:-8000}"               # http://<adresse-du-pc>:8000
+          ADMIN_USER=admin                          # nom du compte NetBox a creer
+          ADMIN_EMAIL=admin@example.com
+          ADMIN_FILE=/root/netbox-admin.txt         # le mot de passe genere y est note
+          # --------------------------------------------
+
+          DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+          PROJECT="$DIR/netbox-docker-release"
+          LOG="$DIR/install.log"
+          exec > >(tee -a "$LOG") 2>&1
+
+          etape()  { printf '\n\033[1;36m==> %s\033[0m\n' "$1"; }
+          ok()     { printf '    \033[32mOK : %s\033[0m\n' "$1"; }
+          erreur() { printf '\n    \033[1;31mERREUR : %s\033[0m\n' "$1"; exit 1; }
+
+          # ---------- 0. Verifications ----------
+          etape "Verification du systeme"
+          [ "$(id -u)" -eq 0 ] || erreur "Lancez le script en root (tapez d'abord : su -   puis relancez)."
+          . /etc/os-release
+          [ "${VERSION_ID:-}" = "12" ] || erreur "Ce paquet est prevu pour Debian 12 (systeme detecte : ${PRETTY_NAME:-inconnu})."
+          [ "$(dpkg --print-architecture)" = "amd64" ] || erreur "Processeur non pris en charge : il faut un PC 64 bits Intel ou AMD (amd64)."
+          [ -f "$PROJECT/netbox-images.tar" ] || erreur "netbox-docker-release/netbox-images.tar introuvable a cote du script."
+          ls "$DIR"/debs/*.deb >/dev/null 2>&1 || erreur "Dossier debs/ (paquets Docker) introuvable a cote du script."
+          libre=$(df -Pk /var/lib | awk 'NR==2 {print int($4/1024/1024)}')
+          [ "$libre" -ge 10 ] || erreur "Pas assez d'espace libre dans /var/lib : ${libre} Go (10 Go minimum)."
+          ok "Debian 12, amd64, ${libre} Go libres"
+
+          # ---------- 1. Docker ----------
+          etape "Installation de Docker"
+          if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
+              ok "Docker deja installe"
+          else
+              echo "    Installation des paquets (1 a 2 minutes)..."
+              if ! apt-get install -y --no-download "$DIR"/debs/*.deb; then
+                  echo "    apt a refuse, nouvel essai avec dpkg..."
+                  dpkg -i "$DIR"/debs/*.deb || erreur "installation des paquets Docker echouee (details dans install.log)."
+              fi
+              ok "Docker installe"
+          fi
+          systemctl enable --now docker >/dev/null 2>&1
+          for i in $(seq 1 30); do docker info >/dev/null 2>&1 && break; sleep 2; done
+          docker info >/dev/null 2>&1 || erreur "Docker ne demarre pas. Voir : journalctl -u docker"
+          ok "Docker est pret (et demarrera tout seul avec le PC)"
+
+          # ---------- 2. Images ----------
+          etape "Chargement des images NetBox"
+          cd "$PROJECT" || erreur "dossier $PROJECT introuvable."
+          # port + delai de demarrage plus long : au 1er lancement NetBox prepare sa base
+          cat > docker-compose.override.yml <<EOF
+          services:
+            netbox:
+              ports:
+                - "${PORT}:8080"
+              healthcheck:
+                start_period: 900s
+          EOF
+          manquante=0
+          for img in $(docker compose config --images); do
+              docker image inspect "$img" >/dev/null 2>&1 || manquante=1
+          done
+          if [ "$manquante" -eq 1 ]; then
+              echo "    Chargement de netbox-images.tar (1 a 3 minutes)..."
+              docker load -i netbox-images.tar || erreur "docker load a echoue."
+              ok "images chargees"
+          else
+              ok "images deja presentes"
+          fi
+
+          # ---------- 3. NetBox ----------
+          etape "Demarrage de NetBox (5 a 20 minutes au premier lancement)"
+          docker compose up -d --pull never || echo "    NetBox prepare encore sa base de donnees, on patiente..."
+          fin=$(( $(date +%s) + 1200 ))
+          sante=absent
+          while [ "$(date +%s)" -lt "$fin" ]; do
+              id=$(docker compose ps -q netbox)
+              if [ -n "$id" ]; then sante=$(docker inspect -f '{{.State.Health.Status}}' "$id" 2>/dev/null); else sante=absent; fi
+              echo "    etat de netbox : $sante"
+              [ "$sante" = "healthy" ] && break
+              sleep 10
+          done
+          [ "$sante" = "healthy" ] || erreur "NetBox n'est pas pret apres 20 minutes. Relancez le script, ou voir : docker compose logs netbox"
+          # 2e passage : demarre les conteneurs qui attendaient que NetBox soit pret (worker, etc.)
+          docker compose up -d --pull never || erreur "docker compose up a echoue (voir les messages ci-dessus)."
+          docker update --restart unless-stopped $(docker compose ps -q) >/dev/null
+          ok "NetBox fonctionne (et redemarrera tout seul avec le PC)"
+
+          # ---------- 4. Compte administrateur ----------
+          etape "Creation du compte administrateur '$ADMIN_USER'"
+          existe=$(docker compose exec -T netbox /opt/netbox/netbox/manage.py shell -c \
+            "from django.contrib.auth import get_user_model; print(get_user_model().objects.filter(username='$ADMIN_USER').exists())" 2>/dev/null)
+          if echo "$existe" | grep -q True; then
+              ok "le compte '$ADMIN_USER' existe deja (mot de passe dans $ADMIN_FILE)"
+          else
+              # mot de passe genere automatiquement (ou impose via NETBOX_ADMIN_PASSWORD)
+              MDP="${NETBOX_ADMIN_PASSWORD:-$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 16)}"
+              docker compose exec -T -e "DJANGO_SUPERUSER_PASSWORD=$MDP" netbox \
+                  /opt/netbox/netbox/manage.py createsuperuser --noinput --username "$ADMIN_USER" --email "$ADMIN_EMAIL" \
+                  || erreur "creation du compte echouee."
+              ( umask 077; printf 'NetBox\nIdentifiant  : %s\nMot de passe : %s\n' "$ADMIN_USER" "$MDP" > "$ADMIN_FILE" )
+              ok "compte cree"
+          fi
+
+          # ---------- Fin ----------
+          IP=$(hostname -I 2>/dev/null | awk '{print $1}')
+          etape "Installation terminee"
+          echo "    Sur ce PC              : http://localhost:${PORT}"
+          [ -n "$IP" ] && echo "    Depuis un autre PC     : http://${IP}:${PORT}"
+          echo "    Identifiant            : ${ADMIN_USER}"
+          echo "    Mot de passe           : $(sed -n 's/^Mot de passe : //p' "$ADMIN_FILE" 2>/dev/null)"
+          echo "    (note dans $ADMIN_FILE)"
+          NBEOF
+          cat > lanceur.sh <<'NBEOF'
+          #!/usr/bin/env bash
+          # =====================================================================
+          #  netbox-debian.run : installeur NetBox autonome pour Debian 12
+          #  Usage :   bash netbox-debian.run
+          #  (contient les paquets Docker, les images NetBox et le script)
+          # =====================================================================
+          SELF="$(readlink -f "$0")"
+          if [ "$(id -u)" -ne 0 ]; then
+              echo "Droits administrateur necessaires."
+              if command -v sudo >/dev/null 2>&1 && { sudo -n true 2>/dev/null || id -nG | grep -qw sudo; }; then
+                  exec sudo bash "$SELF" "$@"
+              else
+                  echo "Entrez le mot de passe root :"
+                  exec su -c "bash '$SELF'" root
+              fi
+          fi
+          DEST=/opt/netbox
+          echo "==> Extraction du paquet dans $DEST (1 a 3 minutes)..."
+          mkdir -p "$DEST"
+          LIGNE=$(awk '/^__PAQUET_NETBOX__$/ { print NR + 1; exit }' "$SELF")
+          tail -n +"$LIGNE" "$SELF" | tar -xz -C "$DEST" || { echo "ERREUR : extraction impossible (fichier incomplet ? retelechargez-le)."; exit 1; }
+          exec bash "$DEST/installer-netbox.sh"
+          exit 0
+          __PAQUET_NETBOX__
+          NBEOF
+
+      - name: Assembler netbox-debian.run
+        run: |
+          sudo tar -C paquet -czf paquet.tar.gz .
+          cat lanceur.sh paquet.tar.gz > netbox-debian.run
+          ls -lh netbox-debian.run
+          taille=$(stat -c %s netbox-debian.run)
+          if [ "$taille" -ge 2147483648 ]; then echo "Fichier trop gros pour GitHub (2 Go max)"; exit 1; fi
+
+      - name: Publier a l'adresse fixe
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete netbox-debian --repo "$GITHUB_REPOSITORY" --cleanup-tag --yes || true
+          gh release create netbox-debian netbox-debian.run --repo "$GITHUB_REPOSITORY" \
+            --title "Installeur NetBox pour Debian 12" \
+            --notes "Construit le $(date '+%d/%m/%Y'). Sur Debian 12 : bash netbox-debian.run"
